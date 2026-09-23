@@ -190,8 +190,9 @@ del Robbins antes de responder.
 **Funciona y es usable, pero es joven.** Lo que significa:
 
 - Probado en Fedora 44 con Ryzen 7 y 24 GB de RAM
-- Instalador automatizado probado en Fedora 44 (VM limpia)
-- Teóricamente compatible con Ubuntu, Arch y MacOS (bash 3.2+), sin probar
+- Probado en Ubuntu 26.04 LTS (VM limpia)
+- Instalador automatizado probado en Fedora 44 y Ubuntu 26.04 LTS (VM limpia)
+- Teóricamente compatible con Arch y MacOS (bash 3.2+), sin probar
 - Sin tests automatizados todavía
 - Sin instalador gráfico (por ahora, es un CLI)
 
