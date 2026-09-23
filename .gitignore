@@ -1,0 +1,47 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# uv
+.uv/
+
+# Variables de entorno (NUNCA commitear)
+.env
+.env.local
+.env.*.local
+mcp_config.json
+
+# Modelos descargados (2 GB+, se bajan solos)
+.cache/
+models/
+*.safetensors
+*.bin
+
+# Backups locales
+*.bak
+*.orig
+*.rej
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
