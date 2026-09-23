@@ -1,140 +1,189 @@
 #!/usr/bin/env python3
 """
-Servidor MCP que expone multiples workspaces de AnythingLLM como
-herramientas independientes para Google Antigravity.
+Servidor MCP que expone múltiples workspaces de AnythingLLM como
+herramientas independientes para Google Antigravity y otros clientes MCP.
 
-Ollama NO se usa aqui. Solo se llama al endpoint de busqueda vectorial
-de AnythingLLM, que devuelve fragmentos crudos con citas (libro + pagina).
+Ollama genera los embeddings durante la indexación en AnythingLLM.
+Este servidor consulta AnythingLLM y aplica un reranker multilingüe local.
 """
 
+import asyncio
 import os
+from dotenv import load_dotenv
 import httpx
 from mcp.server.fastmcp import FastMCP
 from sentence_transformers import CrossEncoder
 
-# Reranker para mejorar la relevancia de los fragmentos
-RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-reranker = CrossEncoder(RERANKER_MODEL, device="cpu")
+# Cargar variables de entorno desde .env si existe
+load_dotenv()
 
-ANYTHINGLLM_URL = os.getenv("ANYTHINGLLM_URL", "http://localhost:3001")
+
+class AnythingLLMError(Exception):
+    """Excepción personalizada para errores de conexión, autenticación o configuración con AnythingLLM."""
+    pass
+
+
+# Detección de dispositivo (GPU / Apple Silicon / CPU)
+def _get_device() -> str:
+    env_device = os.getenv("RERANKER_DEVICE")
+    if env_device:
+        return env_device
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+reranker = CrossEncoder(RERANKER_MODEL, device=_get_device())
+
+ANYTHINGLLM_URL = os.getenv("ANYTHINGLLM_URL", "http://localhost:3001").rstrip("/")
 API_KEY = os.getenv("ANYTHINGLLM_API_KEY", "")
+
+# Slugs de workspaces configurables con valores por defecto
+WS_BASICAS = os.getenv("WORKSPACE_BASICAS", "ciencias-basicas")
+WS_FISIOLOGIA = os.getenv("WORKSPACE_FISIOLOGIA", "fisiologia")
+WS_PATOLOGIA = os.getenv("WORKSPACE_PATOLOGIA", "patologia")
+WS_PROPEDEUTICA = os.getenv("WORKSPACE_PROPEDEUTICA", "propedeutica")
+WS_FARMACOLOGIA = os.getenv(
+    "WORKSPACE_FARMACOLOGIA",
+    os.getenv("ANYTHINGLLM_WORKSPACE", "mi-espacio-de-trabajo")
+)
 
 mcp = FastMCP("anythingllm-medicina")
 
 
-async def _buscar(workspace: str, query: str, top_n: int = 20) -> str:
+async def _buscar(workspace: str, query: str, top_k: int = 8) -> str:
     """
-    Busca fragmentos en AnythingLLM y los reordena con un cross-encoder
-    para mejorar la precisión antes de devolverlos a Antigravity.
+    Busca fragmentos en AnythingLLM y los reordena con el CrossEncoder
+    sin bloquear el bucle de eventos.
     """
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            f"{ANYTHINGLLM_URL}/api/v1/workspace/{workspace}/vector-search",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            json={
-                "query": query,
-                "topN": top_n,          # Pedimos más fragmentos de los que necesitamos
-                "scoreThreshold": 0.15, # Umbral bajo para no perder nada en la primera etapa
-            },
+    initial_fetch = max(top_k * 2, 20)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{ANYTHINGLLM_URL}/api/v1/workspace/{workspace}/vector-search",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                json={
+                    "query": query,
+                    "topN": initial_fetch,
+                    "scoreThreshold": 0.15,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        raise AnythingLLMError(
+            f"No se pudo conectar con AnythingLLM en {ANYTHINGLLM_URL}. "
+            "Verifica que AnythingLLM esté abierto y en ejecución."
         )
-        resp.raise_for_status()
-        data = resp.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            raise AnythingLLMError("API key de AnythingLLM inválida o sin permisos.")
+        if e.response.status_code == 404:
+            raise AnythingLLMError(
+                f"El workspace '{workspace}' no existe en AnythingLLM. "
+                "Revisa los slugs configurados."
+            )
+        raise AnythingLLMError(
+            f"Error en la API de AnythingLLM (código {e.response.status_code}): {e.response.text}"
+        )
+    except Exception as e:
+        raise AnythingLLMError(f"Error inesperado al consultar AnythingLLM: {str(e)}")
 
     results = data.get("results", [])
     if not results:
-        return f"No se encontraron fragmentos relevantes en {workspace}."
+        return f"No se encontraron fragmentos relevantes en el workspace '{workspace}'."
 
-    # Preparar pares (query, texto) para el reranker
     pairs = [(query, chunk.get("text", "")) for chunk in results]
 
-    # Obtener scores del reranker
-    scores = reranker.predict(pairs)
+    # Inferencia en hilo secundario para no bloquear el event loop
+    scores = await asyncio.to_thread(reranker.predict, pairs)
 
-    # Reordenar los fragmentos por score (descendente)
     ranked = sorted(zip(results, scores), key=lambda x: x[1], reverse=True)
-
-    # Quedarnos con los 5 mejores
-    top_chunks = ranked[:8]
+    top_chunks = ranked[:top_k]
 
     fragmentos = []
     for i, (chunk, score) in enumerate(top_chunks, 1):
         meta = chunk.get("metadata", {})
-        titulo = meta.get("title", "Sin titulo")
-        pagina = meta.get("page", "?")
+        titulo = meta.get("title") or meta.get("file_name") or chunk.get("title") or "Sin título"
+        pagina = meta.get("page") or meta.get("pageNumber") or "?"
         texto = chunk.get("text", "")
         fragmentos.append(
-            f"[{i}] ({titulo}, pag. {pagina}) [relevancia: {score:.3f}]\n{texto}"
+            f"[{i}] ({titulo}, pág. {pagina}) [relevancia: {score:.3f}]\n{texto}"
         )
 
     return "\n\n---\n\n".join(fragmentos)
 
 
 @mcp.tool()
-async def buscar_basicas(query: str, top_n: int = 20) -> str:
+async def buscar_basicas(query: str, top_k: int = 8) -> str:
     """
-    Busca en libros de ciencias basicas (bioquimica, histologia,
-    anatomia, biologia celular).
+    Busca en libros de ciencias básicas (bioquímica, histología, anatomía, biología celular).
 
     Args:
         query: Consulta en lenguaje natural.
-        top_n: Numero de fragmentos a devolver (por defecto 6).
+        top_k: Número de fragmentos más relevantes a devolver tras el reranking (por defecto 8).
     """
-    return await _buscar("ciencias-basicas", query, top_n)
+    return await _buscar(WS_BASICAS, query, top_k)
 
 
 @mcp.tool()
-async def buscar_fisiologia(query: str, top_n: int = 20) -> str:
+async def buscar_fisiologia(query: str, top_k: int = 8) -> str:
     """
-    Busca en libros de fisiologia medica (Constanzo, Guyton, Boron).
-    Usalo para entender funcion normal, mecanismos fisiologicos,
-    homeostasis, regulacion endocrina y cardiovascular.
+    Busca en libros de fisiología médica (Constanzo, Guyton, Boron).
+    Úsalo para entender función normal, mecanismos fisiológicos, homeostasis y regulación.
 
     Args:
-        query: Consulta en lenguaje natural sobre fisiologia.
-        top_n: Numero de fragmentos a devolver (por defecto 6).
+        query: Consulta en lenguaje natural sobre fisiología.
+        top_k: Número de fragmentos más relevantes a devolver tras el reranking (por defecto 8).
     """
-    return await _buscar("fisiologia", query, top_n)
+    return await _buscar(WS_FISIOLOGIA, query, top_k)
 
 
 @mcp.tool()
-async def buscar_patologia(query: str, top_n: int = 20) -> str:
+async def buscar_patologia(query: str, top_k: int = 8) -> str:
     """
-    Busca en libros de patologia (Robbins, Kumar, Rubin).
-    Usalo para entender mecanismos de enfermedad, cambios morfologicos,
-    fisiopatologia, inflamacion y neoplasias.
+    Busca en libros de patología (Robbins, Kumar, Rubin).
+    Úsalo para entender mecanismos de enfermedad, cambios morfológicos y fisiopatología.
 
     Args:
-        query: Consulta en lenguaje natural sobre patologia.
-        top_n: Numero de fragmentos a devolver (por defecto 6).
+        query: Consulta en lenguaje natural sobre patología.
+        top_k: Número de fragmentos más relevantes a devolver tras el reranking (por defecto 8).
     """
-    return await _buscar("patologia", query, top_n)
+    return await _buscar(WS_PATOLOGIA, query, top_k)
+
 
 @mcp.tool()
-async def buscar_propedeutica(query: str, top_n: int = 20) -> str:
+async def buscar_propedeutica(query: str, top_k: int = 8) -> str:
     """
-    Busca en libros de propedeutica clinica (Argente-Alvarez, Surós,
-    Bates). Usalo para semiologia, tecnica de exploracion fisica,
-    reconocimiento de signos y sintomas, maniobras exploratorias y
-    hallazgos al examen fisico.
+    Busca en libros de propedéutica clínica (Argente-Álvarez, Surós, Bates).
+    Úsalo para semiología, técnica de exploración física, signos, síntomas y maniobras.
 
     Args:
-        query: Consulta en lenguaje natural sobre propedeutica.
-        top_n: Numero de fragmentos a devolver (por defecto 10).
+        query: Consulta en lenguaje natural sobre propedéutica.
+        top_k: Número de fragmentos más relevantes a devolver tras el reranking (por defecto 8).
     """
-    return await _buscar("propedeutica", query, top_n)
+    return await _buscar(WS_PROPEDEUTICA, query, top_k)
+
 
 @mcp.tool()
-async def buscar_farmacologia(query: str, top_n: int = 20) -> str:
+async def buscar_farmacologia(query: str, top_k: int = 8) -> str:
     """
-    Busca en libros de farmacologia (Katzung, Goodman, Mendoza).
-    Usalo para mecanismos de accion farmacologica, dosis, interacciones,
-    contraindicaciones, farmacocinetica y efectos adversos.
+    Busca en libros de farmacología (Katzung, Goodman, Mendoza).
+    Úsalo para mecanismos de acción farmacológica, dosis, interacciones y efectos adversos.
 
     Args:
-        query: Consulta en lenguaje natural sobre farmacologia.
-        top_n: Numero de fragmentos a devolver (por defecto 6).
+        query: Consulta en lenguaje natural sobre farmacología.
+        top_k: Número de fragmentos más relevantes a devolver tras el reranking (por defecto 8).
     """
-    return await _buscar("mi-espacio-de-trabajo", query, top_n)
+    return await _buscar(WS_FARMACOLOGIA, query, top_k)
 
 
 if __name__ == "__main__":
