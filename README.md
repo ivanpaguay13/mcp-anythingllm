@@ -101,13 +101,48 @@ indexación**. En las consultas no actúa. El único que genera texto es Gemini
 ---
 
 ## Instalación rápida
-bash
-git clone https://github.com/TU_USUARIO/mcp-anythingllm.git
-cd mcp-anythingllm
-uv sync
+## Instalación
 
-Para la instalación completa (incluye Ollama, AnythingLLM, Antigravity y
- la configuración de los workspaces), ver **[docs/INSTALL.md](docs/INSTALL.md)**.
+### Opción A — Instalador automatizado (recomendado)
+
+```bash
+git clone https://github.com/ivanpaguay13/mcp-anythingllm.git
+cd mcp-anythingllm
+./install.sh
+```
+El instalador funciona en dos fases:
+
+- **Fase 1** (`./install.sh`): instala Ollama, uv, las dependencias Python
+  y descarga los modelos (`bge-m3` + `bge-reranker-v2-m3`).
+- **Fase 2** (`./install.sh --configure`): configura Antigravity con tu
+  API key. Se ejecuta cuando ya tienes AnythingLLM instalado y funcionando.
+
+Al terminar la Fase 1, el script muestra los pasos manuales que faltan
+(instalar AnythingLLM, crear workspaces, subir PDFs, obtener la API key).
+
+### Opción B — Instalación manual
+
+Si prefieres hacerlo todo a mano paso por paso, ver **[docs/INSTALL.md](docs/INSTALL.md)**.
+---
+## Notas sobre el instalador
+
+- **Se ejecuta con bash**, no con el shell del usuario. Aunque tú uses zsh
+  (macOS) o fish, el script siempre corre con bash. Funciona en bash 3.2+,
+  que es la versión que trae macOS por defecto.
+
+- **No instala AnythingLLM.** Esa aplicación requiere interacción gráfica
+  (AppImage, `.dmg` o instalador oficial) y no se puede automatizar sin
+  comprometer la seguridad. El instalador te indica cuándo instalarlo.
+
+- **No sube tus PDFs.** La indexación es una operación de UI en AnythingLLM
+  y requiere tus decisiones (qué libros, en qué workspace, etc.).
+
+- **Idempotente**: se puede ejecutar varias veces sin romper nada. Detecta
+  lo que ya está instalado y no lo reinstala.
+
+- **Solo pide `sudo` para lo necesario**: instalar paquetes del sistema
+  (dnf/apt/pacman) y configurar Ollama como servicio systemd. Todo lo demás
+  corre con tu usuario normal.
 
 ---
 ## Uso
@@ -155,9 +190,10 @@ del Robbins antes de responder.
 **Funciona y es usable, pero es joven.** Lo que significa:
 
 - Probado en Fedora 44 con Ryzen 7 y 24 GB de RAM
-- No probado en otras distribuciones ni en macOS (feedback bienvenido)
+- Instalador automatizado probado en Fedora 44 (VM limpia)
+- Teóricamente compatible con Ubuntu, Arch y MacOS (bash 3.2+), sin probar
 - Sin tests automatizados todavía
-- Sin instalador gráfico (por ahora, es un README honesto)
+- Sin instalador gráfico (por ahora, es un CLI)
 
 ---
 
@@ -166,7 +202,7 @@ del Robbins antes de responder.
 - [x] Reranking con `bge-reranker-v2-m3`
 - [x] Soporte para múltiples workspaces
 - [x] Consultas multi-workspace en una sola conversación
-- [ ] Script de instalación automatizado
+- [x] Script de instalación automatizado
 - [ ] Soporte para Anki vía MCP
 - [ ] Filtro por libro específico en las consultas
 - [ ] Verificación en macOS con Apple Silicon
@@ -189,7 +225,7 @@ Abre un issue **antes** de trabajar en algo grande, para evitar duplicación.
 
 ---
 
-##Licencia
+## Licencia
 
 El código está licenciado bajo **AGPL-3.0-or-later**. Ver [LICENSE](LICENSE).
 
