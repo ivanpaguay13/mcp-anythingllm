@@ -58,29 +58,22 @@ busca) y Antigravity (que razona y genera respuestas).
   Cursor, etc.
 
 ## Arquitectura
+```mermaid
+flowchart TD
+    PDFs["Tus PDFs de medicina<br/>(Katzung, Robbins, Constanzo, Argente)"]
+    Ollama["Ollama<br/>(bge-m3)"]
+    AnythingLLM["AnythingLLM<br/>(LanceDB)"]
+    Wrapper["Wrapper MCP<br/>(bge-reranker-v2-m3)"]
+    Antigravity["Antigravity<br/>(Gemini)"]
+    Response["Respuesta con citas<br/>(libro + página)"]
 
-┌──────────────────┐
-│ Tus PDFs │ (Katzung, Robbins, Constanzo, Argente...)
-│ de medicina │
-└────────┬─────────┘
-│ (indexación, una sola vez)
-▼
-┌──────────────────┐ ┌─────────────────┐
-│ AnythingLLM │◀───│ Ollama │
-│ (LanceDB) │ │ (bge-m3) │
-└────────┬─────────┘ └─────────────────┘
-│ /vector-search (API REST)
-▼
-┌──────────────────┐
-│ Este wrapper │ ← bge-reranker-v2-m3
-│ (MCP server) │
-└────────┬─────────┘
-│ MCP (stdio)
-▼
-┌──────────────────┐
-│ Antigravity │ → Respuesta con citas
-│ (Gemini) │
-└──────────────────┘
+    PDFs -->|indexación, una vez| AnythingLLM
+    Ollama -->|embeddings| AnythingLLM
+    AnythingLLM -->|API REST /vector-search| Wrapper
+    Wrapper -->|MCP stdio| Antigravity
+    Antigravity --> Response
+```
+
 **Aclaración:** Ollama solo se usa para **generar embeddings durante la
 indexación**. En las consultas no actúa. El único que genera texto es Gemini
 (o el modelo que elijas) dentro de Antigravity
