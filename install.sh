@@ -17,7 +17,6 @@ readonly INSTALL_DIR="${HOME}/mcp-anythingllm"
 readonly CONFIG_DIR="${HOME}/.gemini/config"
 readonly CONFIG_FILE="${CONFIG_DIR}/mcp_config.json"
 
-# Colores con ANSI-C quoting (garantiza el byte ESC)
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[1;33m'
 readonly RED=$'\033[0;31m'
@@ -51,6 +50,20 @@ detect_os() {
     fi
 }
 
+# Cargar el entorno de Homebrew UNA VEZ al inicio en macOS
+init_macos_env() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+        log "Homebrew cargado desde /opt/homebrew (Apple Silicon)"
+    elif [[ -x /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+        log "Homebrew cargado desde /usr/local (Intel)"
+    fi
+}
+
 # ============================================================
 # FASE 2 - CONFIGURAR ANTIGRAVITY
 # ============================================================
@@ -65,7 +78,7 @@ configure_antigravity() {
         error "No se encontró $INSTALL_DIR/server.py. Ejecuta primero la Fase 1."
     fi
 
-    if ! command -v ollama &>/dev/null; then
+    if ! command -v ollama &>/dev/null && [[ ! -d "/Applications/Ollama.app" ]]; then
         error "Ollama no está instalado. Ejecuta primero la Fase 1."
     fi
 
@@ -167,9 +180,16 @@ install_system_deps() {
             sudo pacman -S --noconfirm git curl python
             ;;
         macos)
-            if ! command -v brew &>/dev/null; then
-                error "Homebrew no está instalado. Instálalo desde https://brew.sh"
+            if ! xcode-select -p &>/dev/null; then
+                error "Faltan las Xcode Command Line Tools. Ejecuta primero:
+    xcode-select --install
+  Y vuelve a ejecutar este script cuando termine la instalación."
             fi
+
+            if ! command -v brew &>/dev/null; then
+                error "Homebrew no encontrado. Instálalo desde https://brew.sh"
+            fi
+
             brew install git curl python
             ;;
         *)
@@ -192,6 +212,14 @@ install_ollama() {
 
     if [[ "$os" == "macos" ]]; then
         brew install ollama
+        echo ""
+        warn "En macOS, Ollama se ejecuta como app de menú, no como servicio."
+        warn "Descarga Ollama.app desde https://ollama.com/download/mac"
+        warn "y ábrela antes de continuar."
+        warn ""
+        warn "El script intentará arrancar 'ollama serve' en segundo plano"
+        warn "para poder descargar bge-m3 automáticamente."
+        echo ""
     else
         curl -fsSL https://ollama.com/install.sh | sh
     fi
@@ -216,6 +244,8 @@ configure_ollama() {
             fi
         done
         log "Variables añadidas a $zshrc"
+        warn "Nota: si usas Ollama.app, estas variables no le afectan."
+        warn "Solo aplican cuando ejecutas 'ollama' desde la terminal."
     else
         local override_dir="/etc/systemd/system/ollama.service.d"
         local override_file="${override_dir}/override.conf"
@@ -238,28 +268,54 @@ EOF
 pull_embedder() {
     header "Descargando modelo de embeddings (bge-m3, ~1.2 GB)"
 
-    if ollama list 2>/dev/null | grep -q "bge-m3"; then
-        log "bge-m3 ya está descargado"
-        return
+    if ! command -v ollama &>/dev/null; then
+        warn "Ollama no está en el PATH."
+        warn "Saltando descarga. Ejecuta 'ollama pull bge-m3' cuando inicies Ollama."
+        return 0
     fi
 
-    ollama pull bge-m3
+    # En macOS, si el daemon no responde, arrancarlo en segundo plano
+    if ! ollama list &>/dev/null; then
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            log "Ollama no responde, iniciando 'ollama serve' en segundo plano..."
+            ollama serve &>/dev/null &
+            sleep 4
+        fi
+    fi
+
+    if ollama list 2>/dev/null | grep -q "bge-m3"; then
+        log "bge-m3 ya está descargado"
+        return 0
+    fi
+
+    # Usar '|| warn' para que set -e no aborte el script si falla
+    ollama pull bge-m3 || warn "No se pudo descargar bge-m3 automáticamente. Inicia Ollama y ejecuta 'ollama pull bge-m3' manualmente."
 }
 
 # ============================================================
 # INSTALAR UV
 # ============================================================
 install_uv() {
+    local os="$1"
     header "Instalando uv (gestor de paquetes Python)"
 
     if command -v uv &>/dev/null; then
         log "uv ya está instalado ($(uv --version))"
-        return
+    else
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="${HOME}/.local/bin:${PATH}"
+        log "uv instalado en ~/.local/bin/uv"
     fi
 
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="${HOME}/.local/bin:${PATH}"
-    log "uv instalado en ~/.local/bin/uv"
+    # Persistir el PATH de uv en el shell config correspondiente
+    if [[ "$os" == "macos" ]]; then
+        local zshrc="${HOME}/.zshrc"
+        touch "$zshrc"
+        if ! grep -q '\.local/bin' "$zshrc" 2>/dev/null; then
+            echo 'export PATH="${HOME}/.local/bin:${PATH}"' >> "$zshrc"
+            log "PATH de uv persistido en $zshrc"
+        fi
+    fi
 }
 
 # ============================================================
@@ -302,7 +358,17 @@ download_reranker() {
     cd "$INSTALL_DIR"
     "${HOME}/.local/bin/uv" run python -c "
 from sentence_transformers import CrossEncoder
-CrossEncoder('BAAI/bge-reranker-v2-m3', device='cpu')
+import torch
+
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
+else:
+    device = 'cpu'
+
+print(f'Usando device: {device}')
+CrossEncoder('BAAI/bge-reranker-v2-m3', device=device)
 print('Reranker descargado y listo')
 "
 }
@@ -371,6 +437,18 @@ final_summary_phase1() {
 # MAIN
 # ============================================================
 main() {
+    # Detectar OS y cargar Homebrew ANTES de procesar cualquier flag
+    local os
+    os="$(detect_os)"
+
+    if [[ "$os" == "unknown" ]]; then
+        error "No se pudo detectar el sistema operativo"
+    fi
+
+    if [[ "$os" == "macos" ]]; then
+        init_macos_env
+    fi
+
     # Fase 2
     if [[ "${1:-}" == "--configure" ]]; then
         log "Instalador de MCP AnythingLLM - Fase 2 (configuración)"
@@ -400,20 +478,13 @@ EOF
     # Fase 1
     printf "\n"
     log "Instalador de MCP AnythingLLM - Fase 1 (instalación)"
-
-    local os
-    os="$(detect_os)"
     log "Sistema operativo detectado: $os"
-
-    if [[ "$os" == "unknown" ]]; then
-        error "No se pudo detectar el sistema operativo"
-    fi
 
     install_system_deps "$os"
     install_ollama "$os"
     configure_ollama "$os"
     pull_embedder
-    install_uv
+    install_uv "$os"
     setup_repo
     install_python_deps
     download_reranker
